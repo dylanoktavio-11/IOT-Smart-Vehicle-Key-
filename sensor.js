@@ -64,7 +64,7 @@ function buildAccessLog(uid, ignition) {
   return { uid, vin: VIN, time, state, prevHash, logHash };
 }
 
-// Odometer proof-of-history: each reading is hashed together with the previous hash
+// Odometer proof-of-history
 function buildOdometerRecord() {
   const time = new Date().toISOString();
   const odometerKm = Number(sim.odometerKm.toFixed(3));
@@ -145,7 +145,7 @@ function buildImu(phase, crash) {
   return { accel: round(accel, 3), gyro: round(gyro, 1) };
 }
 
-// ---------- main loop (1 second per tick) ----------
+// main loop
 function loop() {
   tick++;
 
@@ -188,7 +188,7 @@ function loop() {
     // Odometer proof-of-history every 10 s
   if (tick % 10 === 0) publish("odometer", buildOdometerRecord());
 
-  // PN532 NFC tap, only while parked
+  // PN532 NFC tap
   if (phase === "parked" && chance(0.12)) {
     publish("nfc", { reader: "PN532", ...buildAccessLog(pick(NFC_TAGS), phase === "driving") });
   }
