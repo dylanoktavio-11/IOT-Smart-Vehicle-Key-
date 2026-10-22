@@ -1,12 +1,12 @@
 const mqtt = require("mqtt");
+const crypto = require("crypto");
+const sha256 = (text) => crypto.createHash("sha256").update(text).digest("hex");
 
 const BROKER_URL = "mqtt://broker.hivemq.com";
-const BASE_TOPIC = "smart-vehicle-key-demo/vehicle-001"; // must match sensor.js
+const BASE_TOPIC = "smart-vehicle-key-demo/vehicle-001"; 
 
-// Key cache on the vehicle (edge check): only these tags may unlock the door
 const AUTHORIZED_UIDS = new Set(["04:A1:B2:C3", "04:D4:E5:F6"]);
 
-// Thresholds (adjust to your vehicle spec)
 const CRASH_G = 4.0;
 const IMPACT_G = 2.0;
 const TOW_SPEED_KMH = 5;
@@ -21,7 +21,6 @@ const client = mqtt.connect(BROKER_URL, {
   reconnectPeriod: 2_000,
 });
 
-// Latest known vehicle state, built from all sensor topics
 const state = {
   ignition: false,
   lat: null,
@@ -35,6 +34,9 @@ const state = {
   tireLevels: {},
   towAlert: false,
   armedUntil: 0,
+  lastLogHash: null,
+  lastOdoHash: null,
+  odometerKm: null,
 };
 
 // ---------- helpers ----------
@@ -43,6 +45,18 @@ const compass = (deg) =>
   ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(deg / 45) % 8];
 const mapsLink = () => `https://maps.google.com/?q=${state.lat},${state.lon}`;
 const notify = (msg) => console.log(`\n🚨 [${time()}] ${msg}\n`);
+
+// Verify a hash-chained record: recompute the hash, then check the link to the previous record
+function verifyChain(fields, claimedHash, prevHash, lastKnownHash) {
+  const recomputed = sha256([...fields, prevHash].join("|"));
+  if (recomputed !== claimedHash) {
+    return { ok: false, reason: "hash mismatch (data was modified)" };
+  }
+  if (lastKnownHash !== null && prevHash !== lastKnownHash) {
+    return { ok: false, reason: "chain broken (missing or reordered log)" };
+  }
+  return { ok: true };
+}
 
 // ---------- processing logic ----------
 function checkTowing() {
@@ -93,8 +107,21 @@ const handlers = {
     checkTowing();
   },
 
-  // PN532 NFC reader (backup physical key)
+  // PN532 NFC reader
   nfc(d) {
+    const check = verifyChain(
+      [d.uid, d.vin, d.time, d.state],
+      d.logHash,
+      d.prevHash,
+      state.lastLogHash
+    );
+    state.lastLogHash = d.logHash; // resync so one failure does not repeat forever
+
+    if (!check.ok) {
+      return notify(`ACCESS LOG INTEGRITY FAILURE: ${check.reason}. Tap rejected.`);
+    }
+    console.log(`🔐 [${time()}] Access log verified, SHA-256 ${d.logHash.slice(0, 16)}...`);
+
     if (AUTHORIZED_UIDS.has(d.uid)) {
       console.log(`✅ [${time()}] NFC ${d.uid}: ACCESS GRANTED, door unlocked (backup key)`);
     } else {
@@ -119,6 +146,25 @@ const handlers = {
       }
     }
   },
+
+    // Odometer proof-of-history
+  odometer(d) {
+    const check = verifyChain(
+      [d.vin, d.odometerKm, d.time],
+      d.odoHash,
+      d.prevHash,
+      state.lastOdoHash
+    );
+    state.lastOdoHash = d.odoHash;
+
+    if (!check.ok) {
+      return notify(`ODOMETER INTEGRITY FAILURE: ${check.reason}`);
+    }
+    if (state.odometerKm !== null && d.odometerKm < state.odometerKm) {
+      return notify(`ODOMETER ROLLBACK: ${state.odometerKm} km -> ${d.odometerKm} km`);
+    }
+    state.odometerKm = d.odometerKm;
+  },
 };
 
 // ---------- dashboard (every 5 seconds) ----------
@@ -136,6 +182,7 @@ function printDashboard() {
   console.log(`🧭 Motion   : ${state.speed} km/h, heading ${state.heading}° ${compass(state.heading)}`);
   console.log(`📳 IMU      : ${state.accelG.toFixed(2)} g, tilt ${state.pitch.toFixed(1)}°`);
   console.log(`🛞 TPMS     : FL ${tire("FL")} | FR ${tire("FR")} | RL ${tire("RL")} | RR ${tire("RR")}`);
+  console.log(`📏 Odometer : ${state.odometerKm ?? "-"} km (hash ${state.lastOdoHash?.slice(0, 12) ?? "-"}...)`);
   console.log("=".repeat(56));
 }
 setInterval(printDashboard, 5000);

@@ -1,9 +1,11 @@
 const mqtt = require("mqtt");
+const crypto = require("crypto");
 
 const BROKER_URL = "mqtt://broker.hivemq.com";
 const VEHICLE_ID = "vehicle-001";
+const VIN = "SVK1234567890ABCD";
+const GENESIS_HASH = "0".repeat(64);
 
-// Change this prefix so it is unique on the public broker (must match subscriber.js)
 const BASE_TOPIC = "smart-vehicle-key-demo/vehicle-001";
 
 const client = mqtt.connect(BROKER_URL, {
@@ -12,6 +14,7 @@ const client = mqtt.connect(BROKER_URL, {
 });
 
 // ---------- helpers ----------
+const sha256 = (text) => crypto.createHash("sha256").update(text).digest("hex");
 const rand = (min, max) => Math.random() * (max - min) + min;
 const chance = (p) => Math.random() < p;
 const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
@@ -40,6 +43,7 @@ const sim = {
   crashed: false,
   // Absolute pressure in kPa (about 33 psi gauge)
   tires: { FL: 330, FR: 330, RL: 330, RR: 330 },
+  odometerKm: 12500,
 };
 
 let phaseIdx = 0;
@@ -47,6 +51,31 @@ let phaseStart = Date.now();
 let tick = 0;
 let crashDone = false;
 let started = false;
+let lastLogHash = GENESIS_HASH; // access-log chain
+let lastOdoHash = GENESIS_HASH; // odometer chain
+
+// Flowchart step "Sign log": Hash(UID + VIN + Time + State), chained to the previous log
+function buildAccessLog(uid, ignition) {
+  const time = new Date().toISOString();
+  const state = ignition ? "IGNITION_ON" : "IGNITION_OFF";
+  const prevHash = lastLogHash;
+  const logHash = sha256([uid, VIN, time, state, prevHash].join("|"));
+  lastLogHash = logHash;
+  return { uid, vin: VIN, time, state, prevHash, logHash };
+}
+
+// Odometer proof-of-history: each reading is hashed together with the previous hash
+function buildOdometerRecord() {
+  const time = new Date().toISOString();
+  const odometerKm = Number(sim.odometerKm.toFixed(3));
+  const prevHash = lastOdoHash;
+  const odoHash = sha256([VIN, odometerKm, time, prevHash].join("|"));
+  lastOdoHash = odoHash;
+
+  // Demo: run with TAMPER=1 to publish a rolled-back value AFTER hashing
+  const published = process.env.TAMPER ? odometerKm - 5000 : odometerKm;
+  return { vin: VIN, odometerKm: published, time, prevHash, odoHash };
+}
 
 // ---------- publish ----------
 function publish(sub, data) {
@@ -62,7 +91,7 @@ function publish(sub, data) {
   });
 }
 
-// ---------- sensor models ----------
+//sensor models
 function updateMotion(phase) {
   if (sim.crashed) {
     sim.speed = 0;
@@ -76,14 +105,14 @@ function updateMotion(phase) {
     sim.speed = 0;
   }
 
-  // Move the GNSS position (1 second per tick)
+  // GNSS
   const meters = sim.speed / 3.6;
   const rad = (sim.heading * Math.PI) / 180;
   sim.lat += (meters * Math.cos(rad)) / 111_320;
   sim.lon += (meters * Math.sin(rad)) / (111_320 * Math.cos((sim.lat * Math.PI) / 180));
 }
 
-// MPU6050: accelerometer in g (rest = 1 g on z), gyroscope in deg/s
+// MPU6050
 function buildImu(phase, crash) {
   const tilt = phase === "towed" ? rand(12, 18) : rand(-1, 1); // front lifted when towed
   const p = (tilt * Math.PI) / 180;
@@ -140,6 +169,8 @@ function loop() {
 
   updateMotion(phase);
 
+  sim.odometerKm += sim.speed / 3600; // km per 1 second tick
+
   // MPU6050 every 1 s
   publish("imu", buildImu(phase, crash));
 
@@ -154,12 +185,15 @@ function loop() {
     });
   }
 
+    // Odometer proof-of-history every 10 s
+  if (tick % 10 === 0) publish("odometer", buildOdometerRecord());
+
   // PN532 NFC tap, only while parked
   if (phase === "parked" && chance(0.12)) {
-    publish("nfc", { reader: "PN532", uid: pick(NFC_TAGS) });
+    publish("nfc", { reader: "PN532", ...buildAccessLog(pick(NFC_TAGS), phase === "driving") });
   }
 
-  // TPMS via CAN bus every 5 s (rear-right tire has a slow leak)
+  // TPMS via CAN bus 
   sim.tires.RR = Math.max(200, sim.tires.RR - 0.6);
   if (tick % 5 === 0) {
     const pressureKpa = {};
