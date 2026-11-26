@@ -14,5 +14,9 @@
     "in": "^0.19.0",
     "mqtt": "^5.16.1",
     "terminal": "^0.1.4"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.2",
+    "hardhat": "^2.30.0"
   }
 }
